@@ -332,3 +332,30 @@ The highest-impact changes were:
 
 The main lesson: the agent needs to behave like a careful browser user after
 validation appears, not like a static scraper that gives up after one submit.
+
+## Retry Learning: June 17, 2026
+
+A focused retry pass on 100 previously difficult plumbing/HVAC rows improved
+reached-out count from 11 to 26. The extra 15 came from retrying only
+validation/no-field failures after improving form behavior.
+
+Add these behaviors before running retry backlogs:
+
+- Use a broad visible-control prefill when a form is detected but no outreach
+  fields are mapped. This recovered pages whose fields were inside custom
+  wrappers or had weak labels.
+- Skip dropdown placeholders beyond the obvious `Select...` values. Treat
+  labels like `Interested In`, `Service Category`, `Service Category Needed`,
+  `Pick one`, and `How can we help` as placeholders, not valid choices.
+- Prefer real generic choices such as `Other`, `General`, `Inquiry`,
+  `Business`, `Consultation`, `Referral`, or `Contact`.
+- For state dropdowns, prefer `TX` or `Texas`.
+- If direct JavaScript value setting fails on masked email/phone fields, fall
+  back to typing into the field like a user.
+- Re-run validation repair up to three times because some form builders reveal
+  one missing field at a time.
+
+Stop retrying automatically when a v4-style targeted retry produces no new
+submissions. The remaining failures are usually deeper issues: CAPTCHA token
+injection not attaching, iframe/vendor forms, hidden location/date widgets,
+or custom validation that requires a manual interaction path.

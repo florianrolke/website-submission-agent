@@ -293,7 +293,7 @@ def validate_sender_config(name, email):
 
 async def set_field_value(page, selector, value):
     """Use the browser-native value setter first; fallback to Playwright fill."""
-    return await page.evaluate("""(args) => {
+    return await page.evaluate(r"""(args) => {
         const [selector, val] = args;
         const el = document.querySelector(selector);
         if (!el) return false;
@@ -305,12 +305,36 @@ async def set_field_value(page, selector, value):
         el.focus();
         const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(el, value);
-        else el.value = value;
+        try {
+            if (setter) setter.call(el, value);
+            else el.value = value;
+        } catch (e) {
+            el.value = value;
+        }
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new Event('blur', { bubbles: true }));
         return String(el.value) === value;
+    }""", [selector, value])
+
+
+async def type_field_value(page, selector, value):
+    """Fallback for masked fields that ignore direct JS value assignment."""
+    locator = page.locator(selector).first
+    await locator.scroll_into_view_if_needed(timeout=5000)
+    await locator.click(timeout=5000)
+    await locator.press("Control+A")
+    await locator.type(str(value), delay=20)
+    return await page.evaluate(r"""(args) => {
+        const [selector, expected] = args;
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        const actual = String(el.value || '').replace(/\D/g, '');
+        const wanted = String(expected || '').replace(/\D/g, '');
+        return String(el.value || '').trim().length > 0 && (!wanted || actual.endsWith(wanted.slice(-7)));
     }""", [selector, value])
 
 
@@ -1743,6 +1767,8 @@ async def repair_validation_fields(page, name, email, phone, company, subject, m
         function desiredValue(el) {
             const type = (el.type || '').toLowerCase();
             const ctx = ctxFor(el);
+            const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+            const isoDate = nextWeek.toISOString().slice(0, 10);
             if (ctx.includes('captcha') || ctx.includes('recaptcha') || ctx.includes('honeypot')) return null;
             if (ctx.includes('first') && ctx.includes('name')) return firstName;
             if (ctx.includes('last') && ctx.includes('name')) return lastName;
@@ -1757,8 +1783,9 @@ async def repair_validation_fields(page, name, email, phone, company, subject, m
             if (ctx.includes('zip') || ctx.includes('postal')) return postalCode;
             if (ctx.includes('address') || ctx.includes('street') || ctx.includes('service location')) return fullAddress || address;
             if (ctx.includes('service') || ctx.includes('request') || ctx.includes('type')) return 'Mitigation partnership inquiry';
-            if (ctx.includes('date')) return '';
-            if (ctx.includes('time')) return '';
+            if (type === 'date' || ctx.includes('date')) return type === 'date' ? isoDate : 'Next week';
+            if (type === 'time') return '09:00';
+            if (ctx.includes('time') || ctx.includes('timeline') || ctx.includes('preferred')) return 'Next week';
             if (el.tagName === 'TEXTAREA' || ctx.includes('message') || ctx.includes('comment') ||
                 ctx.includes('question') || ctx.includes('description') || ctx.includes('details') ||
                 ctx.includes('issue') || ctx.includes('how can we help')) return message;
@@ -1786,7 +1813,7 @@ async def repair_validation_fields(page, name, email, phone, company, subject, m
             if (!options.length) return false;
             const ctx = ctxFor(el);
             let option = null;
-            option = options.find(o => /other|general|inquiry|contact|business|service|consultation|referral/i.test(o.textContent || ''));
+            option = options.find(o => /as soon|soon|next week|morning|flexible|other|general|inquiry|contact|business|service|consultation|referral/i.test(o.textContent || ''));
             if (!option && ctx.includes('state')) option = options.find(o => /texas|tx/i.test(o.textContent || ''));
             if (!option) option = options[0];
             el.value = option.value;
@@ -1844,12 +1871,157 @@ async def repair_validation_fields(page, name, email, phone, company, subject, m
     }""", [name, email, phone, company, subject, message, address, city, state, postal_code])
 
 
+async def broad_prefill_visible_controls(page, name, email, phone, company, subject, message,
+                                         address, city, state, postal_code):
+    """Fill visible form controls when normal field mapping found no usable fields."""
+    return await page.evaluate(r"""(args) => {
+        const [fullName, email, phone, company, subject, message, address, city, state, postalCode] = args;
+        const [firstName, ...lastParts] = String(fullName || '').split(/\s+/);
+        const lastName = lastParts.join(' ') || '';
+        const phoneDigits = String(phone || '').replace(/\D/g, '');
+        const fullAddress = [address, city, state, postalCode].filter(Boolean).join(', ');
+        const labels = [];
+        let filled = 0;
+
+        function visible(el) {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && r.width > 5 && r.height > 5;
+        }
+        function labelFor(el) {
+            const labelEl = el.closest('label') || (el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null);
+            const nearby = el.closest('.gfield, .form-field, .field, .form-group, .wpcf7-form-control-wrap, li, p, div');
+            return `${labelEl?.textContent || ''} ${el.previousElementSibling?.textContent || ''} ${nearby?.textContent || ''}`.replace(/\s+/g, ' ').trim();
+        }
+        function ctxFor(el) {
+            return `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${labelFor(el)}`.toLowerCase();
+        }
+        function ignored(el) {
+            const ctx = ctxFor(el);
+            const type = (el.type || '').toLowerCase();
+            return ['submit','button','image','reset','file','password','hidden'].includes(type) ||
+                /search|login|password|username|captcha|recaptcha|honeypot|payment|credit card|card number|checkout|cart/.test(ctx);
+        }
+        function valueFor(el) {
+            const type = (el.type || '').toLowerCase();
+            const ctx = ctxFor(el);
+            if (ctx.includes('first') && ctx.includes('name')) return firstName;
+            if (ctx.includes('last') && ctx.includes('name')) return lastName || fullName;
+            if (ctx.includes('full name') || (ctx.includes('name') && !ctx.includes('email') && !ctx.includes('company'))) return fullName;
+            if (type === 'email' || ctx.includes('email')) return email;
+            if (type === 'tel' || ctx.includes('phone') || ctx.includes('telephone') || ctx.includes('mobile')) return phone;
+            if (type === 'number' && (ctx.includes('phone') || ctx.includes('tel'))) return phoneDigits;
+            if (ctx.includes('company') || ctx.includes('organization') || ctx.includes('business')) return company || fullName;
+            if (ctx.includes('subject')) return subject || 'Mitigation partnership inquiry';
+            if (ctx.includes('city')) return city;
+            if (ctx.includes('state') || ctx.includes('province')) return state;
+            if (ctx.includes('zip') || ctx.includes('postal')) return postalCode;
+            if (ctx.includes('address') || ctx.includes('street') || ctx.includes('location')) return fullAddress || address;
+            if (el.tagName === 'TEXTAREA' || ctx.includes('message') || ctx.includes('comment') || ctx.includes('question') ||
+                ctx.includes('description') || ctx.includes('details') || ctx.includes('how can we help')) return message;
+            if (ctx.includes('service') || ctx.includes('request') || ctx.includes('type')) return 'Mitigation partnership inquiry';
+            if (el.required || el.getAttribute('aria-required') === 'true' || ctx.includes('*') || ctx.includes('required')) return 'Business partnership inquiry';
+            return null;
+        }
+        function setValue(el, val) {
+            if (!val) return false;
+            const type = (el.type || '').toLowerCase();
+            if (type === 'number') val = String(val).replace(/\D/g, '');
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(el, val);
+            else el.value = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+            filled++;
+            labels.push((labelFor(el) || el.name || el.id || el.tagName).slice(0, 80));
+            return true;
+        }
+        function chooseSelect(el) {
+            const ctx = ctxFor(el);
+            const options = Array.from(el.options || []).filter(o => {
+                const text = (o.textContent || '').trim().toLowerCase();
+                const value = String(o.value || '').trim().toLowerCase();
+                return !o.disabled && value && !/^(select|choose|please|interested in|service category|service category needed|--|—)/.test(text);
+            });
+            if (!options.length) return false;
+            let option = null;
+            if (ctx.includes('state')) option = options.find(o => /^(tx|texas)$/i.test((o.textContent || '').trim()) || /^(tx|texas)$/i.test(String(o.value || '').trim()));
+            if (!option) option = options.find(o => /other|general|inquiry|business|consultation|service|referral|contact/i.test(o.textContent || ''));
+            if (!option) option = options[0];
+            el.value = option.value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+            filled++;
+            labels.push((labelFor(el) || el.name || 'select').slice(0, 80));
+            return true;
+        }
+
+        const forms = Array.from(document.querySelectorAll('form'));
+        const roots = forms.length ? forms : [document.body];
+        const scored = roots.map(root => {
+            const text = `${root.innerText || ''} ${root.id || ''} ${root.className || ''}`.toLowerCase();
+            const controls = Array.from(root.querySelectorAll('input, textarea, select')).filter(el => visible(el) && !ignored(el));
+            let score = controls.length;
+            if (root.querySelector('textarea')) score += 5;
+            if (/contact|message|quote|estimate|request|service|appointment|inquiry|get in touch/.test(text)) score += 8;
+            if (/search|login|checkout|cart|payment/.test(text)) score -= 20;
+            return { root, controls, score };
+        }).sort((a, b) => b.score - a.score);
+        const controls = scored[0]?.controls || [];
+        for (const el of controls) {
+            const type = (el.type || '').toLowerCase();
+            if (el.tagName === 'SELECT') {
+                chooseSelect(el);
+            } else if (type === 'radio') {
+                const group = controls.filter(x => x.type === 'radio' && x.name === el.name);
+                if (!group.some(x => x.checked)) {
+                    const choice = group.find(x => /other|general|yes|private|service/i.test(`${x.value || ''} ${labelFor(x)}`)) || group[0];
+                    if (choice) {
+                        choice.checked = true;
+                        choice.dispatchEvent(new Event('change', { bubbles: true }));
+                        filled++;
+                        labels.push((labelFor(choice) || choice.name || 'radio').slice(0, 80));
+                    }
+                }
+            } else if (type === 'checkbox') {
+                if (!el.checked && /agree|consent|message|sms|email|terms|privacy|required/i.test(ctxFor(el))) {
+                    el.checked = true;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    filled++;
+                    labels.push((labelFor(el) || el.name || 'checkbox').slice(0, 80));
+                }
+            } else if (!String(el.value || '').trim()) {
+                setValue(el, valueFor(el));
+            }
+        }
+        return { filled, labels: Array.from(new Set(labels)).slice(0, 12) };
+    }""", [name, email, phone, company, subject, message, address, city, state, postal_code])
+
+
 async def quick_verify_submission_state(page):
     """Compact verification used after validation repair resubmits."""
     return await page.evaluate(r"""() => {
         const body = (document.body?.innerText || '').toLowerCase();
+        function visible(el) {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && r.width > 5 && r.height > 5;
+        }
+        function ignoredControl(el) {
+            const formText = (el.form?.innerText || '').toLowerCase();
+            const ctx = `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${formText}`.toLowerCase();
+            if (ctx.includes('honeypot') || ctx.includes('captcha') || ctx.includes('recaptcha')) return true;
+            if (ctx.includes('password') || formText.includes('login')) return true;
+            if (/search|site-search|wp-block-search|search the site/.test(ctx) && !/message|comment|contact|quote|estimate|request/.test(formText)) return true;
+            return false;
+        }
         const invalid = Array.from(document.querySelectorAll('input, textarea, select')).find(el => {
-            try { return el.willValidate && !el.checkValidity(); } catch(e) { return false; }
+            try { return visible(el) && !ignoredControl(el) && el.willValidate && !el.checkValidity(); } catch(e) { return false; }
         });
         if (invalid) {
             const labelEl = invalid.closest('label') || (invalid.id ? document.querySelector(`label[for="${CSS.escape(invalid.id)}"]`) : null);
@@ -1920,6 +2092,13 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
         parts = name.split(" ", 1)
         fill_order.append(("first_name", parts[0]))
         fill_order.append(("last_name", parts[1] if len(parts) > 1 else ""))
+    elif fields.get("first_name"):
+        # Some forms label one combined field as "First/Last name".
+        # If there is no separate last-name field, use the full name.
+        fill_order.append(("first_name", name))
+    elif fields.get("last_name"):
+        parts = name.split(" ", 1)
+        fill_order.append(("last_name", parts[1] if len(parts) > 1 else name))
     elif fields.get("name"):
         fill_order.append(("name", name))
     if fields.get("email"):
@@ -1948,13 +2127,32 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
             fill_order.append((fname, generic_required_text_value(fdata.get("label", ""), message)))
 
     if not fill_order:
-        return {
-            "status": "no_fillable_fields",
-            "fields_filled": [],
-            "captcha_type": captcha_info.get("type", "none"),
-            "missing_required": [],
-            "note": "Detected a form container, but no fillable outreach fields were mapped. Submission skipped."
-        }
+        try:
+            broad = await broad_prefill_visible_controls(
+                page, name, email, phone, company, subject, message,
+                address, city, state, postal_code
+            )
+            if broad.get("filled"):
+                for label in broad.get("labels", []):
+                    filled.append(f"broad:{label}")
+                print(f"    [FORM] Broad prefill filled {broad.get('filled')} visible control(s)")
+                await page.wait_for_timeout(800)
+            else:
+                return {
+                    "status": "no_fillable_fields",
+                    "fields_filled": [],
+                    "captcha_type": captcha_info.get("type", "none"),
+                    "missing_required": [],
+                    "note": "Detected a form container, but no fillable outreach fields were mapped. Submission skipped."
+                }
+        except Exception as e:
+            return {
+                "status": "no_fillable_fields",
+                "fields_filled": [],
+                "captcha_type": captcha_info.get("type", "none"),
+                "missing_required": [],
+                "note": f"Detected a form container, but no fillable outreach fields were mapped. Broad fallback failed: {str(e)[:120]}"
+            }
 
     # Check for missing required fields
     fill_names = {n for n, _ in fill_order}
@@ -1979,6 +2177,8 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
                 success = await fill_address_with_autocomplete(page, sel, value)
             if not success:
                 success = await set_field_value(page, sel, value)
+            if not success and fname in ("email", "phone"):
+                success = await type_field_value(page, sel, value)
             if not success:
                 await page.fill(sel, value, timeout=5000)
             filled.append(fname)
@@ -1996,9 +2196,34 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
         if not options:
             continue
 
+        def is_placeholder_option(opt):
+            text = str(opt.get("text", "")).strip().lower()
+            value = str(opt.get("value", "")).strip().lower()
+            if not text and not value:
+                return True
+            placeholder_prefixes = (
+                "select", "choose", "please", "--", "—", "-",
+                "interested in", "service category", "service category needed", "pick one",
+                "how can we help", "what service"
+            )
+            return text.startswith(placeholder_prefixes) or value.startswith(placeholder_prefixes)
+
+        valid_options = [opt for opt in options if not is_placeholder_option(opt)]
+        if not valid_options:
+            valid_options = options
+
         # Smart selection: pick the most generic/relevant option
         chosen = None
-        for opt in options:
+        if "state" in (label or "").lower():
+            for opt in valid_options:
+                text = opt["text"].lower()
+                value = str(opt.get("value", "")).lower()
+                if text in ("tx", "texas") or value in ("tx", "texas"):
+                    chosen = opt
+                    break
+        for opt in valid_options:
+            if chosen:
+                break
             text = opt["text"].lower()
             # Prefer generic options
             if any(kw in text for kw in ["other", "general", "inquiry", "business", "consultation", "referral", "website"]):
@@ -2006,16 +2231,27 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
                 break
         if not chosen:
             # Pick the first non-empty option (skip "Select..." / "Choose..." placeholders)
-            for opt in options:
+            for opt in valid_options:
                 if not opt["text"].lower().startswith(("select", "choose", "please", "--", "—")):
                     chosen = opt
                     break
-        if not chosen and options:
-            chosen = options[0]
+        if not chosen and valid_options:
+            chosen = valid_options[0]
 
         if chosen:
             try:
-                await page.select_option(fdata["selector"], chosen["value"])
+                selected = await page.evaluate("""(args) => {
+                    const [selector, value] = args;
+                    const el = document.querySelector(selector);
+                    if (!el || el.tagName !== 'SELECT') return false;
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return el.value === value;
+                }""", [fdata["selector"], chosen["value"]])
+                if not selected:
+                    await page.select_option(fdata["selector"], chosen["value"], timeout=5000)
                 filled.append(f"{label}={chosen['text']}")
                 print(f"    [FORM] Selected '{chosen['text']}' for dropdown '{label}'")
                 await page.wait_for_timeout(300)
@@ -2048,7 +2284,7 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
                     break
 
         try:
-            await page.locator(chosen["selector"]).check(timeout=5000, force=True)
+            await page.locator(chosen["selector"]).first.check(timeout=5000, force=True)
             filled.append(f"{fdata.get('label', fname)}={chosen.get('label') or chosen.get('value')}")
             print(f"    [FORM] Checked {fdata.get('type')} '{chosen.get('label') or chosen.get('value')}'")
             await page.wait_for_timeout(300)
@@ -2141,6 +2377,20 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
         verification = await page.evaluate(r"""() => {
         const body = document.body.innerText.toLowerCase();
         const html = document.body.innerHTML.toLowerCase();
+        function visible(el) {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && r.width > 5 && r.height > 5;
+        }
+        function ignoredControl(el) {
+            const formText = (el.form?.innerText || '').toLowerCase();
+            const ctx = `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${formText}`.toLowerCase();
+            if (ctx.includes('honeypot') || ctx.includes('captcha') || ctx.includes('recaptcha')) return true;
+            if (ctx.includes('password') || formText.includes('login')) return true;
+            if (/search|site-search|wp-block-search|search the site/.test(ctx) && !/message|comment|contact|quote|estimate|request/.test(formText)) return true;
+            return false;
+        }
 
         if (
             body.includes('step 2 of 2') ||
@@ -2153,7 +2403,7 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
 
         // Check for success confirmation messages
         const invalid = Array.from(document.querySelectorAll('input, textarea, select')).find(el => {
-            try { return el.willValidate && !el.checkValidity(); } catch(e) { return false; }
+            try { return visible(el) && !ignoredControl(el) && el.willValidate && !el.checkValidity(); } catch(e) { return false; }
         });
         if (invalid) {
             const labelEl = invalid.closest('label') || document.querySelector(`label[for="${invalid.id}"]`);
@@ -2286,20 +2536,30 @@ async def fill_and_submit(page, name, email, message, subject="", phone="", comp
     elif verification.get("confirmed") is False:
         if verification.get("type") in ("browser_validation", "validation_error", "webflow_fail"):
             try:
-                repair = await repair_validation_fields(
-                    page, name, email, phone, company, subject, message,
-                    address, city, state, postal_code
-                )
-                result["validation_repair"] = repair
-                if repair.get("filled", 0) > 0:
-                    print(f"    [REPAIR] Filled {repair.get('filled')} validation field(s): {', '.join(repair.get('labels', [])[:4])}")
+                repairs = []
+                for repair_attempt in range(1, 4):
+                    repair = await repair_validation_fields(
+                        page, name, email, phone, company, subject, message,
+                        address, city, state, postal_code
+                    )
+                    repair["attempt"] = repair_attempt
+                    repairs.append(repair)
+                    if repair.get("filled", 0) <= 0:
+                        break
+
+                    print(f"    [REPAIR-{repair_attempt}] Filled {repair.get('filled')} validation field(s): {', '.join(repair.get('labels', [])[:4])}")
                     clicked = await click_visible_submit(page, fields.get("submit", {}).get("selector"))
                     if not clicked:
                         await page.keyboard.press("Enter")
                     await page.wait_for_timeout(8000)
                     repaired_verification = await quick_verify_submission_state(page)
-                    print(f"    [VERIFY-REPAIR] {repaired_verification.get('type')}: \"{repaired_verification.get('match', '')}\"")
+                    print(f"    [VERIFY-REPAIR-{repair_attempt}] {repaired_verification.get('type')}: \"{repaired_verification.get('match', '')}\"")
                     verification = repaired_verification
+                    if verification.get("confirmed") is not False:
+                        break
+                    if verification.get("type") not in ("browser_validation", "validation_error", "webflow_fail"):
+                        break
+                result["validation_repair"] = repairs
             except Exception as e:
                 result["validation_repair"] = {"error": str(e)[:200]}
 

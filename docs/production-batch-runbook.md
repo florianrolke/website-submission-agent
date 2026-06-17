@@ -175,6 +175,14 @@ Stop or switch to manual review when most remaining rows are:
 - `mailto_only`
 - `checkout_or_payment_page`
 - repeated `captcha_failed`
+- repeated `failed_validation` after broad prefill, typed email/phone fallback,
+  dropdown placeholder filtering, and three validation-repair attempts
 
 Those rows usually need another channel, a new lead source, or a human decision
 rather than more blind retries.
+
+For the June 17 plumbing/HVAC retry test, the useful automatic recovery ended
+after the third focused retry pass: the first recovery passes lifted a hard
+100-row retry batch from 11 reached out to 26, while a final 20-row targeted
+retry produced 0 additional submissions. Treat that pattern as the signal to
+move remaining rows into manual review or another outreach channel.
