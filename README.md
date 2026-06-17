@@ -73,6 +73,11 @@ Live run:
 python -X utf8 execution/plumbing_website_submission_agent.py --batch data/sample-plumbing-companies.csv --limit 3
 ```
 
+For production batches and retry runs, see:
+
+- `docs/submission-acceptance-playbook.md`
+- `docs/production-batch-runbook.md`
+
 ## Input Format
 
 CSV and JSON records can include:
@@ -107,3 +112,6 @@ Generated artifacts are intentionally ignored by git:
 Use dry-run or review mode first. Make sure every live submission has a
 legitimate business purpose and complies with the website's terms and applicable
 anti-spam laws.
+
+Never complete checkout, purchase, credit-card, subscription, or domain-buying
+flows. Mark those pages for manual review instead.
