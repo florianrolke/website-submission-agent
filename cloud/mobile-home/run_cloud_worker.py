@@ -27,6 +27,15 @@ AGENT = APP_ROOT / "execution" / "plumbing_website_submission_agent.py"
 AGENT_LOG = APP_ROOT / ".tmp" / "plumbing_website_submission_log.json"
 
 
+def log_event(event: str, **fields: object) -> None:
+    payload = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=True), flush=True)
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -70,6 +79,7 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str] |
 def ensure_source_csv(path: Path) -> None:
     """Create the queue CSV from env when a mounted file is not available."""
     if path.exists():
+        log_event("queue_exists", path=str(path), bytes=path.stat().st_size)
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,17 +88,23 @@ def ensure_source_csv(path: Path) -> None:
     queue_url = os.environ.get("QUEUE_CSV_URL", "").strip()
 
     if queue_b64:
+        log_event("queue_from_b64_start", path=str(path), chars=len(queue_b64))
         path.write_bytes(base64.b64decode(queue_b64))
+        log_event("queue_from_b64_done", path=str(path), bytes=path.stat().st_size)
         return
 
     if queue_text:
+        log_event("queue_from_text_start", path=str(path), chars=len(queue_text))
         path.write_text(queue_text, encoding="utf-8")
+        log_event("queue_from_text_done", path=str(path), bytes=path.stat().st_size)
         return
 
     if queue_url:
+        log_event("queue_download_start", path=str(path), url_host=urlparse(queue_url).netloc)
         request = Request(queue_url, headers={"User-Agent": "website-submission-agent/1.0"})
         with urlopen(request, timeout=60) as response:
             path.write_bytes(response.read())
+        log_event("queue_download_done", path=str(path), bytes=path.stat().st_size)
         return
 
     raise FileNotFoundError(
@@ -206,7 +222,9 @@ def run_once() -> dict[str, object]:
     results_root = Path(os.environ.get("RESULTS_ROOT", "/data/runs"))
     state_file = Path(os.environ.get("STATE_FILE", "/data/state/mobile-home-worker-state.json"))
     limit = int(os.environ.get("BATCH_LIMIT", "25"))
+    timeout_seconds = int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1800"))
 
+    log_event("run_once_start", source_csv=str(source_csv), state_file=str(state_file), limit=limit, mode=os.environ.get("RUN_MODE", "once"), dry_run=env_bool("DRY_RUN"))
     ensure_source_csv(source_csv)
     if not os.environ.get("SENDER_NAME") or not os.environ.get("SENDER_EMAIL"):
         raise RuntimeError("SENDER_NAME and SENDER_EMAIL are required")
@@ -214,8 +232,10 @@ def run_once() -> dict[str, object]:
     state = load_state(state_file)
     attempted = set(str(domain) for domain in state.get("attempted_domains", []))
     source_rows = read_csv(source_csv)
+    log_event("queue_loaded", rows=len(source_rows), attempted=len(attempted))
     batch_rows = pick_batch(source_rows, attempted, limit)
     if not batch_rows:
+        log_event("batch_empty", rows=len(source_rows), attempted=len(attempted))
         return {"status": "exhausted", "picked": 0}
 
     run_id = datetime.now(timezone.utc).strftime("mh-%Y%m%d-%H%M%S")
@@ -228,15 +248,22 @@ def run_once() -> dict[str, object]:
         for row in batch_rows
         if normalize_domain(row.get("website") or row.get("url"))
     }
+    log_event("batch_picked", run_id=run_id, picked=len(batch_rows), domains=sorted(batch_domains)[:5])
 
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
     started = time.time()
     cmd = build_command(batch_csv, run_id, limit)
+    log_event("agent_start", run_id=run_id, timeout_seconds=timeout_seconds, batch_csv=str(batch_csv))
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-        proc = subprocess.run(cmd, cwd=APP_ROOT, stdout=stdout, stderr=stderr, text=True)
+        try:
+            proc = subprocess.run(cmd, cwd=APP_ROOT, stdout=stdout, stderr=stderr, text=True, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            log_event("agent_timeout", run_id=run_id, timeout_seconds=timeout_seconds)
+            raise
 
     result_rows = read_agent_results(batch_domains)
+    log_event("agent_done", run_id=run_id, returncode=proc.returncode, result_rows=len(result_rows))
     write_csv(run_dir / "results.csv", result_rows)
     copy_screenshots(run_dir, result_rows)
     if AGENT_LOG.exists():
@@ -281,3 +308,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
