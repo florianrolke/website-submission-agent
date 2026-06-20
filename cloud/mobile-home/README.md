@@ -256,3 +256,19 @@ Each loop:
 - writes `/data/runs/<run_id>/results.csv`
 - copies screenshots/logs into `/data/runs/<run_id>/`
 - updates state so the next loop continues where it left off
+
+## Reusable Single-Config Coolify Setup
+
+For new client campaigns, the Docker worker no longer needs a long manual env-var setup. Use one campaign JSON file instead:
+
+- Example config: `cloud/mobile-home/config-examples/generic-client-campaign.json`
+- Encode helper: `python cloud/mobile-home/encode_campaign_config.py <campaign.json>`
+- Coolify env: set `CAMPAIGN_CONFIG_B64` to the printed value, or mount the JSON at `/data/config/campaign.json`
+
+The worker still supports the original env variables for the current mobile-home service. It now also writes persistent observability files under `/data/state/`:
+
+- `latest-summary.json`
+- `latest-worker-status.json`
+- `worker-events.jsonl`
+
+See `docs/reusable-website-form-submission-agent-setup.md` for the full reusable setup flow.

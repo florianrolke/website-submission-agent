@@ -4,6 +4,15 @@ services:
       context: ../..
       dockerfile: cloud/mobile-home/Dockerfile
     environment:
+      CAMPAIGN_CONFIG_PATH: "/data/config/campaign.json"
+      CAMPAIGN_CONFIG_JSON: ""
+      CAMPAIGN_CONFIG_B64: ""
+      CAMPAIGN_CONFIG_URL: ""
+      CAMPAIGN_NAME: "mobile-home"
+      RUN_ID_PREFIX: "mh"
+      TEMPLATE_FLAG: "--exact-mobile-home-template"
+      BROWSER_CHANNEL: "chromium"
+      HEADLESS: "true"
       RUN_MODE: "loop"
       SOURCE_CSV: "/data/input/mobile-home-strict-form-submission-queue.csv"
       QUEUE_CSV_B64: ""
@@ -24,6 +33,13 @@ services:
       DRY_RUN: "false"
       REVIEW_BEFORE_SUBMIT: "false"
       CAPSOLVER_API_KEY: ""
+      SUMMARY_FILE: "/data/state/latest-summary.json"
+      WORKER_STATUS_FILE: "/data/state/latest-worker-status.json"
+      WORKER_EVENTS_FILE: "/data/state/worker-events.jsonl"
+      STATUS_SERVER_ENABLED: "false"
+      STATUS_HOST: "0.0.0.0"
+      STATUS_PORT: "8080"
+      STATUS_AUTH_TOKEN: ""
     volumes:
       - mobile-home-submission-data:/data
     restart: unless-stopped

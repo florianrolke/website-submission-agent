@@ -1,31 +1,83 @@
 #!/usr/bin/env python3
-"""Coolify/Hostinger worker for overnight mobile-home form submissions.
+"""Coolify/Hostinger worker for website form submissions.
 
-The worker reads a queue CSV from a persistent volume, selects the next
+The worker reads a campaign queue CSV from persistent storage or config, selects
 unattempted domains, invokes the existing Playwright submission agent, writes
 results/screenshots/logs back to the volume, updates state, and optionally loops.
+
+It remains backward compatible with the original mobile-home environment
+variables, but it can also be configured from one campaign JSON file/env value
+for new client deployments.
 """
 
 from __future__ import annotations
 
-import csv
 import base64
+import csv
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 
 APP_ROOT = Path("/app")
 AGENT = APP_ROOT / "execution" / "plumbing_website_submission_agent.py"
 AGENT_LOG = APP_ROOT / ".tmp" / "plumbing_website_submission_log.json"
+
+SENSITIVE_CONFIG_KEYS = {
+    "CAPSOLVER_API_KEY",
+    "SENDER_EMAIL",
+    "SENDER_PHONE",
+    "STATUS_AUTH_TOKEN",
+}
+
+CONFIG_ENV_MAP = {
+    "campaign_name": "CAMPAIGN_NAME",
+    "run_id_prefix": "RUN_ID_PREFIX",
+    "source_csv": "SOURCE_CSV",
+    "queue_csv_b64": "QUEUE_CSV_B64",
+    "queue_csv_text": "QUEUE_CSV_TEXT",
+    "queue_csv_url": "QUEUE_CSV_URL",
+    "results_root": "RESULTS_ROOT",
+    "state_file": "STATE_FILE",
+    "run_mode": "RUN_MODE",
+    "batch_limit": "BATCH_LIMIT",
+    "loop_sleep_seconds": "LOOP_SLEEP_SECONDS",
+    "agent_timeout_seconds": "AGENT_TIMEOUT_SECONDS",
+    "browser_channel": "BROWSER_CHANNEL",
+    "headless": "HEADLESS",
+    "delay_seconds": "DELAY_SECONDS",
+    "dry_run": "DRY_RUN",
+    "review_before_submit": "REVIEW_BEFORE_SUBMIT",
+    "stop_after_successes": "STOP_AFTER_SUCCESSES",
+    "sender_name": "SENDER_NAME",
+    "sender_email": "SENDER_EMAIL",
+    "sender_phone": "SENDER_PHONE",
+    "sender_address": "SENDER_ADDRESS",
+    "sender_city": "SENDER_CITY",
+    "sender_state": "SENDER_STATE",
+    "sender_postal_code": "SENDER_POSTAL_CODE",
+    "subject": "SUBJECT",
+    "message": "MESSAGE",
+    "template_flag": "TEMPLATE_FLAG",
+    "capsolver_api_key": "CAPSOLVER_API_KEY",
+    "summary_file": "SUMMARY_FILE",
+    "worker_events_file": "WORKER_EVENTS_FILE",
+    "worker_status_file": "WORKER_STATUS_FILE",
+    "status_server_enabled": "STATUS_SERVER_ENABLED",
+    "status_host": "STATUS_HOST",
+    "status_port": "STATUS_PORT",
+    "status_auth_token": "STATUS_AUTH_TOKEN",
+}
 
 
 def log_event(event: str, **fields: object) -> None:
@@ -35,6 +87,17 @@ def log_event(event: str, **fields: object) -> None:
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=True), flush=True)
+    events_file = os.environ.get("WORKER_EVENTS_FILE", "/data/state/worker-events.jsonl").strip()
+    if not events_file:
+        return
+    try:
+        path = Path(events_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        # Logging must never break the outreach run.
+        pass
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -42,6 +105,117 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_json_from_url(url: str) -> dict[str, object]:
+    request = Request(url, headers={"User-Agent": "website-submission-agent/1.0"})
+    with urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def load_campaign_config() -> dict[str, object]:
+    """Load optional campaign config from /data, env JSON, env base64, or URL."""
+    config_path = Path(os.environ.get("CAMPAIGN_CONFIG_PATH", "/data/config/campaign.json"))
+    config_json = os.environ.get("CAMPAIGN_CONFIG_JSON", "").strip()
+    config_b64 = os.environ.get("CAMPAIGN_CONFIG_B64", "").strip()
+    config_url = os.environ.get("CAMPAIGN_CONFIG_URL", "").strip()
+
+    if config_json:
+        return json.loads(config_json)
+    if config_b64:
+        return json.loads(base64.b64decode(config_b64).decode("utf-8"))
+    if config_url:
+        return read_json_from_url(config_url)
+    if config_path.exists():
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def flatten_campaign_config(config: dict[str, object]) -> dict[str, object]:
+    """Accept nested campaign config while keeping env application simple."""
+    flattened: dict[str, object] = {}
+    for key, value in config.items():
+        if key in {"sender", "runtime", "queue", "status"} and isinstance(value, dict):
+            for child_key, child_value in value.items():
+                flattened[f"{key}_{child_key}"] = child_value
+        else:
+            flattened[key] = value
+
+    aliases = {
+        "queue_csv": "source_csv",
+        "queue_source_csv": "source_csv",
+        "queue_url": "queue_csv_url",
+        "runtime_agent_timeout_seconds": "agent_timeout_seconds",
+        "runtime_batch_limit": "batch_limit",
+        "runtime_browser_channel": "browser_channel",
+        "runtime_delay_seconds": "delay_seconds",
+        "runtime_dry_run": "dry_run",
+        "runtime_headless": "headless",
+        "runtime_loop_sleep_seconds": "loop_sleep_seconds",
+        "runtime_review_before_submit": "review_before_submit",
+        "runtime_run_mode": "run_mode",
+        "runtime_stop_after_successes": "stop_after_successes",
+        "sender_postal": "sender_postal_code",
+        "sender_zip": "sender_postal_code",
+        "status_auth_token": "status_auth_token",
+        "status_enabled": "status_server_enabled",
+        "status_host": "status_host",
+        "status_port": "status_port",
+    }
+    for old_key, new_key in aliases.items():
+        if old_key in flattened and new_key not in flattened:
+            flattened[new_key] = flattened[old_key]
+    return flattened
+
+
+def apply_campaign_config(config: dict[str, object]) -> None:
+    flattened = flatten_campaign_config(config)
+    applied: list[str] = []
+    for config_key, env_name in CONFIG_ENV_MAP.items():
+        if config_key not in flattened:
+            continue
+        value = flattened[config_key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            env_value = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            env_value = json.dumps(value, ensure_ascii=True)
+        else:
+            env_value = str(value)
+        os.environ[env_name] = env_value
+        applied.append(env_name)
+
+    if applied:
+        safe_applied: list[str] = []
+        for name in sorted(applied):
+            if name in SENSITIVE_CONFIG_KEYS:
+                safe_applied.append(f"{name}={'SET' if os.environ.get(name, '') else 'EMPTY'}")
+            else:
+                safe_applied.append(name)
+        log_event("campaign_config_applied", keys=safe_applied)
+
+
+def load_and_apply_campaign_config() -> None:
+    try:
+        config = load_campaign_config()
+    except Exception as exc:
+        log_event("campaign_config_error", error=str(exc), error_type=type(exc).__name__)
+        raise
+    if config:
+        apply_campaign_config(config)
+    else:
+        log_event(
+            "campaign_config_not_found",
+            path=os.environ.get("CAMPAIGN_CONFIG_PATH", "/data/config/campaign.json"),
+        )
 
 
 def normalize_domain(url: str | None) -> str:
@@ -203,6 +377,7 @@ def summarize_all_results(results_root: Path) -> dict[str, object]:
 
     success_rate = round((likely_success / total_rows) * 100, 2) if total_rows else 0.0
     return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "run_files": len(files),
         "total_result_rows": total_rows,
         "likely_successful_submissions": likely_success,
@@ -212,6 +387,24 @@ def summarize_all_results(results_root: Path) -> dict[str, object]:
         "status_counts": dict(status_counts.most_common()),
         "last_run_dir": last_run_dir,
     }
+
+
+def write_latest_summary(summary: dict[str, object], result: dict[str, object] | None = None) -> None:
+    payload = dict(summary)
+    if result is not None:
+        payload["last_worker_result"] = result
+    summary_file = Path(os.environ.get("SUMMARY_FILE", "/data/state/latest-summary.json"))
+    write_json_atomic(summary_file, payload)
+
+
+def write_worker_status(status: str, **fields: object) -> None:
+    status_file = Path(os.environ.get("WORKER_STATUS_FILE", "/data/state/latest-worker-status.json"))
+    payload = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        **fields,
+    }
+    write_json_atomic(status_file, payload)
 
 
 def copy_screenshots(run_dir: Path, result_rows: list[dict[str, object]]) -> None:
@@ -238,30 +431,40 @@ def build_command(batch_csv: Path, run_id: str, limit: int) -> list[str]:
         "--limit",
         str(limit),
         "--browser-channel",
-        "chromium",
-        "--headless",
-        "--profile-suffix",
-        run_id,
-        "--name",
-        os.environ.get("SENDER_NAME", ""),
-        "--email",
-        os.environ.get("SENDER_EMAIL", ""),
-        "--phone",
-        os.environ.get("SENDER_PHONE", ""),
-        "--sender-address",
-        os.environ.get("SENDER_ADDRESS", "1455 Clearview Drive"),
-        "--sender-city",
-        os.environ.get("SENDER_CITY", "McKinney"),
-        "--sender-state",
-        os.environ.get("SENDER_STATE", "TX"),
-        "--sender-postal-code",
-        os.environ.get("SENDER_POSTAL_CODE", "75072"),
-        "--subject",
-        os.environ.get("SUBJECT", "Michigan mobile home case study"),
-        "--exact-mobile-home-template",
-        "--delay",
-        os.environ.get("DELAY_SECONDS", "3"),
+        os.environ.get("BROWSER_CHANNEL", "chromium"),
     ]
+    if env_bool("HEADLESS", True):
+        cmd.append("--headless")
+    cmd.extend(
+        [
+            "--profile-suffix",
+            run_id,
+            "--name",
+            os.environ.get("SENDER_NAME", ""),
+            "--email",
+            os.environ.get("SENDER_EMAIL", ""),
+            "--phone",
+            os.environ.get("SENDER_PHONE", ""),
+            "--sender-address",
+            os.environ.get("SENDER_ADDRESS", "1455 Clearview Drive"),
+            "--sender-city",
+            os.environ.get("SENDER_CITY", "McKinney"),
+            "--sender-state",
+            os.environ.get("SENDER_STATE", "TX"),
+            "--sender-postal-code",
+            os.environ.get("SENDER_POSTAL_CODE", "75072"),
+            "--subject",
+            os.environ.get("SUBJECT", "Michigan mobile home case study"),
+            "--delay",
+            os.environ.get("DELAY_SECONDS", "3"),
+        ]
+    )
+    template_flag = os.environ.get("TEMPLATE_FLAG", "--exact-mobile-home-template").strip()
+    if template_flag and template_flag.lower() not in {"0", "false", "none", "off"}:
+        cmd.append(template_flag)
+    message = os.environ.get("MESSAGE", "").strip()
+    if message:
+        cmd.extend(["--message", message])
     if env_bool("DRY_RUN"):
         cmd.append("--dry-run")
     if env_bool("REVIEW_BEFORE_SUBMIT"):
@@ -279,7 +482,22 @@ def run_once() -> dict[str, object]:
     limit = int(os.environ.get("BATCH_LIMIT", "25"))
     timeout_seconds = int(os.environ.get("AGENT_TIMEOUT_SECONDS", "1800"))
 
-    log_event("run_once_start", source_csv=str(source_csv), state_file=str(state_file), limit=limit, mode=os.environ.get("RUN_MODE", "once"), dry_run=env_bool("DRY_RUN"))
+    log_event(
+        "run_once_start",
+        campaign=os.environ.get("CAMPAIGN_NAME", "mobile-home"),
+        source_csv=str(source_csv),
+        state_file=str(state_file),
+        limit=limit,
+        mode=os.environ.get("RUN_MODE", "once"),
+        dry_run=env_bool("DRY_RUN"),
+    )
+    write_worker_status(
+        "running",
+        campaign=os.environ.get("CAMPAIGN_NAME", "mobile-home"),
+        source_csv=str(source_csv),
+        state_file=str(state_file),
+        limit=limit,
+    )
     ensure_source_csv(source_csv)
     if not os.environ.get("SENDER_NAME") or not os.environ.get("SENDER_EMAIL"):
         raise RuntimeError("SENDER_NAME and SENDER_EMAIL are required")
@@ -293,7 +511,8 @@ def run_once() -> dict[str, object]:
         log_event("batch_empty", rows=len(source_rows), attempted=len(attempted))
         return {"status": "exhausted", "picked": 0}
 
-    run_id = datetime.now(timezone.utc).strftime("mh-%Y%m%d-%H%M%S")
+    run_prefix = os.environ.get("RUN_ID_PREFIX", "mh").strip() or "mh"
+    run_id = datetime.now(timezone.utc).strftime(f"{run_prefix}-%Y%m%d-%H%M%S")
     run_dir = results_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     batch_csv = run_dir / "input.csv"
@@ -343,7 +562,92 @@ def run_once() -> dict[str, object]:
     return runs[-1]
 
 
+class StatusHandler(BaseHTTPRequestHandler):
+    server_version = "WebsiteSubmissionWorker/1.0"
+
+    def _authorized(self) -> bool:
+        token = os.environ.get("STATUS_AUTH_TOKEN", "").strip()
+        if not token:
+            return True
+        header = self.headers.get("Authorization", "")
+        query_token = parse_qs(urlsplit(self.path).query).get("token", [""])[0]
+        return header == f"Bearer {token}" or query_token == token
+
+    def _send_json(self, status: int, payload: object) -> None:
+        data = json.dumps(payload, ensure_ascii=True, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json_file(self, path: Path) -> object:
+        if not path.exists():
+            return {"status": "missing", "path": str(path)}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _tail_events(self, path: Path, limit: int = 100) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        events: list[dict[str, object]] = []
+        for line in lines:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                events.append({"raw": line})
+        return events
+
+    def do_GET(self) -> None:
+        if not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        try:
+            if path in {"/", "/health"}:
+                self._send_json(200, {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()})
+            elif path == "/summary":
+                self._send_json(200, self._read_json_file(Path(os.environ.get("SUMMARY_FILE", "/data/state/latest-summary.json"))))
+            elif path == "/status":
+                self._send_json(200, self._read_json_file(Path(os.environ.get("WORKER_STATUS_FILE", "/data/state/latest-worker-status.json"))))
+            elif path == "/events":
+                self._send_json(200, self._tail_events(Path(os.environ.get("WORKER_EVENTS_FILE", "/data/state/worker-events.jsonl"))))
+            else:
+                self._send_json(404, {"error": "not_found"})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc), "error_type": type(exc).__name__})
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def start_status_server() -> None:
+    if not env_bool("STATUS_SERVER_ENABLED", False):
+        return
+    host = os.environ.get("STATUS_HOST", "0.0.0.0")
+    port = int(os.environ.get("STATUS_PORT", "8080"))
+
+    def serve() -> None:
+        try:
+            server = ThreadingHTTPServer((host, port), StatusHandler)
+            log_event(
+                "status_server_start",
+                host=host,
+                port=port,
+                auth_enabled=bool(os.environ.get("STATUS_AUTH_TOKEN", "").strip()),
+            )
+            server.serve_forever()
+        except Exception as exc:
+            log_event("status_server_error", error=str(exc), error_type=type(exc).__name__)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+
 def main() -> int:
+    load_and_apply_campaign_config()
+    start_status_server()
     mode = os.environ.get("RUN_MODE", "once").strip().lower()
     sleep_seconds = int(os.environ.get("LOOP_SLEEP_SECONDS", "300"))
     while True:
@@ -351,11 +655,19 @@ def main() -> int:
             result = run_once()
             print(json.dumps(result, indent=2), flush=True)
             summary = summarize_all_results(Path(os.environ.get("RESULTS_ROOT", "/data/runs")))
+            write_latest_summary(summary, result)
+            write_worker_status("idle", last_worker_result=result, latest_summary=summary)
             log_event("aggregate_summary", **summary)
             if result.get("status") == "exhausted":
                 return 0
         except Exception as exc:
-            print(json.dumps({"status": "error", "error": str(exc)}, indent=2), flush=True)
+            error_payload = {"status": "error", "error": str(exc), "error_type": type(exc).__name__}
+            print(json.dumps(error_payload, indent=2), flush=True)
+            log_event("worker_error", **error_payload)
+            try:
+                write_worker_status("error", **error_payload)
+            except Exception:
+                pass
             if mode != "loop":
                 return 1
         if mode != "loop":

@@ -46,6 +46,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 COPY execution /app/execution
 COPY cloud/mobile-home/run_cloud_worker.py /app/cloud/mobile-home/run_cloud_worker.py
 
-RUN mkdir -p /data/input /data/runs /data/state /app/.tmp
+RUN mkdir -p /data/input /data/runs /data/state /data/config /app/.tmp
+
+EXPOSE 8080
 
 CMD ["python", "/app/cloud/mobile-home/run_cloud_worker.py"]
