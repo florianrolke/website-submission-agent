@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import base64
+from collections import Counter
 import json
 import os
 import shutil
@@ -159,6 +160,60 @@ def read_agent_results(batch_domains: set[str]) -> list[dict[str, object]]:
     return list(latest.values())
 
 
+def row_status(row: dict[str, object]) -> str:
+    for key in ("status", "outcome", "result", "submission_status", "final_status", "phase"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def row_likely_success(row: dict[str, object]) -> bool:
+    text = " ".join(str(row.get(key) or "") for key in row).lower()
+    negative = ("fail", "error", "blocked", "skip", "no form", "no_form", "validation", "captcha_failed", "timeout")
+    positive = ("success", "submitted", "thank you", "received", "sent")
+    return any(token in text for token in positive) and not any(token in text for token in negative)
+
+
+def summarize_all_results(results_root: Path) -> dict[str, object]:
+    files = sorted(results_root.glob("*/results.csv"))
+    status_counts: Counter[str] = Counter()
+    total_rows = 0
+    likely_success = 0
+    rows_with_after_screenshot = 0
+    rows_with_contact_details = 0
+    last_run_dir = ""
+
+    for path in files:
+        last_run_dir = str(path.parent)
+        try:
+            rows = read_csv(path)
+        except Exception as exc:
+            status_counts[f"read_error:{type(exc).__name__}"] += 1
+            continue
+        for row in rows:
+            total_rows += 1
+            status_counts[row_status(row)] += 1
+            if row_likely_success(row):
+                likely_success += 1
+            if str(row.get("screenshot_after") or row.get("after_screenshot") or "").strip():
+                rows_with_after_screenshot += 1
+            if str(row.get("contact_details") or row.get("notes") or row.get("email") or "").strip():
+                rows_with_contact_details += 1
+
+    success_rate = round((likely_success / total_rows) * 100, 2) if total_rows else 0.0
+    return {
+        "run_files": len(files),
+        "total_result_rows": total_rows,
+        "likely_successful_submissions": likely_success,
+        "likely_success_rate_percent": success_rate,
+        "rows_with_after_screenshot": rows_with_after_screenshot,
+        "rows_with_contact_details": rows_with_contact_details,
+        "status_counts": dict(status_counts.most_common()),
+        "last_run_dir": last_run_dir,
+    }
+
+
 def copy_screenshots(run_dir: Path, result_rows: list[dict[str, object]]) -> None:
     screenshot_dir = run_dir / "screenshots"
     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -295,6 +350,8 @@ def main() -> int:
         try:
             result = run_once()
             print(json.dumps(result, indent=2), flush=True)
+            summary = summarize_all_results(Path(os.environ.get("RESULTS_ROOT", "/data/runs")))
+            log_event("aggregate_summary", **summary)
             if result.get("status") == "exhausted":
                 return 0
         except Exception as exc:
