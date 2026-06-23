@@ -47,6 +47,7 @@ CONFIG_ENV_MAP = {
     "queue_csv_b64": "QUEUE_CSV_B64",
     "queue_csv_text": "QUEUE_CSV_TEXT",
     "queue_csv_url": "QUEUE_CSV_URL",
+    "queue_skip_rows": "QUEUE_SKIP_ROWS",
     "results_root": "RESULTS_ROOT",
     "state_file": "STATE_FILE",
     "run_mode": "RUN_MODE",
@@ -308,7 +309,8 @@ def save_state(path: Path, state: dict[str, object]) -> None:
 def pick_batch(source_rows: list[dict[str, str]], attempted: set[str], limit: int) -> list[dict[str, str]]:
     picked: list[dict[str, str]] = []
     seen = set(attempted)
-    for row in source_rows:
+    skip_rows = int(os.environ.get("QUEUE_SKIP_ROWS", "0") or "0")
+    for row in source_rows[skip_rows:]:
         domain = normalize_domain(row.get("website") or row.get("url"))
         if not domain or domain in seen:
             continue
@@ -677,4 +679,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
