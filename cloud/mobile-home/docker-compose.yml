@@ -5,9 +5,9 @@ services:
       dockerfile: cloud/mobile-home/Dockerfile
     environment:
       CAMPAIGN_CONFIG_PATH: "/data/config/campaign.json"
-      CAMPAIGN_CONFIG_JSON: ""
-      CAMPAIGN_CONFIG_B64: ""
-      CAMPAIGN_CONFIG_URL: ""
+      CAMPAIGN_CONFIG_JSON: "${CAMPAIGN_CONFIG_JSON:-}"
+      CAMPAIGN_CONFIG_B64: "${CAMPAIGN_CONFIG_B64:-}"
+      CAMPAIGN_CONFIG_URL: "${CAMPAIGN_CONFIG_URL:-}"
       CAMPAIGN_NAME: "mobile-home"
       RUN_ID_PREFIX: "mh"
       TEMPLATE_FLAG: "--exact-mobile-home-template"
